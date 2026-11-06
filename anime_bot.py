@@ -14,6 +14,7 @@ Render Environment:
 import os
 import re
 import html
+import hashlib
 import time
 import shutil
 import asyncio
@@ -32,9 +33,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InputMediaDocument
 
 logging.basicConfig(level=logging.INFO)
+BOT_STATUS = {"text": "Bot ishga tushmoqda..."}
 
 DB_PATH = os.getenv("DB_PATH", "anime.db")
 ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_ID", "") + " " + os.getenv("ADMIN_IDS", ""))}
@@ -42,16 +45,16 @@ REQUIRED = [c.strip() for c in re.split(r"[,\s]+", os.getenv("REQUIRED_CHANNELS"
 REQUIRED = [c if c.startswith("@") else "@" + c for c in REQUIRED]
 PROTECT = os.getenv("PROTECT_CONTENT", "0") == "1"
 try:
-    BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "6"))
+    BACKUP_MINUTES = float(os.getenv("BACKUP_MINUTES", "30"))
 except ValueError:
-    BACKUP_HOURS = 6.0
+    BACKUP_MINUTES = 30.0
 PAGE = 10
 EP_PAGE = 40
 
 
 # ---------------- Render uchun veb-server va keep-alive ----------------
 async def _root_handler(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text=BOT_STATUS["text"])
 
 
 async def start_web_server():
@@ -79,11 +82,13 @@ def detect_token():
     tok_re = r"\d{6,}:[A-Za-z0-9_-]{30,}"
     env = {k: (v or "").strip().strip('"').strip("'") for k, v in os.environ.items()}
     for k in ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TOKEN"):
-        if re.fullmatch(tok_re, env.get(k, "")):
-            return env[k]
+        m = re.search(tok_re, env.get(k, ""))
+        if m:
+            return m.group(0)
     for v in env.values():
-        if re.fullmatch(tok_re, v):
-            return v
+        m = re.search(tok_re, v)
+        if m:
+            return m.group(0)
     return ""
 
 
@@ -95,6 +100,47 @@ if not TOKEN:
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# ---------------- Token / ulanish diagnostikasi ----------------
+class _StatusLogHandler(logging.Handler):
+    """aiogram loglaridagi Conflict/Unauthorized xatolarini '/' sahifasida ko'rsatadi."""
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        stamp = time.strftime("%H:%M:%S", time.gmtime())
+        if "TelegramConflictError" in msg or "terminated by other getUpdates" in msg:
+            BOT_STATUS["text"] = (
+                f"XATO (Conflict, {stamp} UTC): bu token boshqa joyda ham ishlayapti. "
+                "Eski Render xizmatini, kompyuter yoki boshqa hostingdagi nusxani to'xtating."
+            )
+        elif "TelegramUnauthorizedError" in msg:
+            BOT_STATUS["text"] = f"XATO (Unauthorized, {stamp} UTC): Telegram tokenni qabul qilmadi."
+
+
+logging.getLogger("aiogram").addHandler(_StatusLogHandler())
+
+
+async def wait_for_valid_token():
+    """Token Telegram'da yaroqli ekanini tekshiradi; xatoni logda va '/' sahifada tushunarli ko'rsatadi."""
+    while True:
+        try:
+            me = await bot.get_me()
+            BOT_STATUS["text"] = f"OK: @{me.username} ishlayapti"
+            logging.info("Bot ulandi: @%s", me.username)
+            return
+        except TelegramUnauthorizedError:
+            BOT_STATUS["text"] = (
+                "XATO: Telegram tokenni qabul qilmadi (Unauthorized). Sabablari: token noto'g'ri nusxalangan yoki "
+                "BotFather'da /revoke qilingan. BotFather'dan joriy tokenni oling, Render'da BOT_TOKEN ni yangilab qayta deploy qiling."
+            )
+            logging.error(BOT_STATUS["text"])
+        except Exception as ex:
+            BOT_STATUS["text"] = f"Telegramga ulanib bo'lmadi ({type(ex).__name__}). Qayta urinilmoqda..."
+            logging.error("%s: %s", BOT_STATUS["text"], ex)
+        await asyncio.sleep(60)
+
 
 
 # ---------------- Baza ----------------
@@ -753,15 +799,132 @@ async def on_restore_document(message: types.Message):
     await message.answer("✅ Baza tiklandi!" if ok else "❌ Bu fayl mos emas (titles/episodes jadvallari yo'q).")
 
 
+def _admin_chat_id():
+    return sorted(ADMIN_IDS)[0] if ADMIN_IDS else None
+
+
+# ===================== AVTOMATIK ZAXIRA VA TIKLASH (qadalgan xabar orqali) =====================
+BACKUP_NAME = "anime_backup.db"
+_backup_state = {"hash": None}
+RESTORE_DONE = asyncio.Event()
+_restore_ran = [False]
+
+
+def db_fingerprint():
+    h = hashlib.sha1()
+    with db() as c:
+        for line in c.iterdump():
+            h.update(line.encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def db_has_data():
+    with db() as c:
+        return bool(c.execute("SELECT (SELECT COUNT(*) FROM titles)+(SELECT COUNT(*) FROM episodes)").fetchone()[0])
+
+
+async def _pinned_backup(chat_id):
+    """Admin chatida botning qadalgan zaxira xabarini topadi (bo'lmasa None)."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        pm = getattr(chat, "pinned_message", None)
+        me = await bot.me()
+        doc = getattr(pm, "document", None) if pm else None
+        sender = getattr(pm, "from_user", None) if pm else None
+        if doc and (doc.file_name or "") == BACKUP_NAME and getattr(sender, "id", None) == me.id:
+            return pm
+    except Exception as ex:
+        logging.info("qadalgan zaxira topilmadi: %s", ex)
+    return None
+
+
+async def push_backup(chat_id, force=False):
+    """Baza o'zgargan bo'lsa, zaxirani admin chatidagi bitta qadalgan xabarda yangilaydi."""
+    fp = await asyncio.to_thread(db_fingerprint)
+    if not force and fp == _backup_state["hash"]:
+        return False
+    path = await asyncio.to_thread(make_backup_file)
+    try:
+        caption = "💾 Avtomatik zaxira (yangilanib turadi) · " + time.strftime("%d.%m %H:%M", time.gmtime()) + " UTC"
+        pm = await _pinned_backup(chat_id)
+        done = False
+        if pm:
+            try:
+                await bot.edit_message_media(
+                    chat_id=chat_id, message_id=pm.message_id,
+                    media=InputMediaDocument(media=FSInputFile(path, filename=BACKUP_NAME), caption=caption))
+                done = True
+            except Exception as ex:
+                logging.info("zaxirani joyida yangilab bo'lmadi: %s", ex)
+        if not done:
+            m = await bot.send_document(chat_id, FSInputFile(path, filename=BACKUP_NAME), caption=caption, disable_notification=True)
+            try:
+                await bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
+            except Exception as ex:
+                logging.warning("zaxirani qadab bo'lmadi: %s", ex)
+        _backup_state["hash"] = fp
+        return True
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def startup_restore():
+    """Baza bo'sh bo'lsa (Render qayta ishga tushgan), qadalgan zaxiradan avtomatik tiklaydi."""
+    try:
+        chat_id = _admin_chat_id()
+        if not chat_id:
+            logging.info("ADMIN_ID yo'q: avtomatik tiklash o'chiq")
+            return
+        if await asyncio.to_thread(db_has_data):
+            _backup_state["hash"] = await asyncio.to_thread(db_fingerprint)
+            return
+        pm = await _pinned_backup(chat_id)
+        if not pm:
+            logging.info("qadalgan zaxira yo'q: bo'sh baza bilan boshlanadi")
+            return
+        tmp = os.path.join(tempfile.gettempdir(), "auto_restore.db")
+        try:
+            await bot.download(pm.document.file_id, destination=tmp)
+            ok = await asyncio.to_thread(restore_db_file, tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if ok:
+            _backup_state["hash"] = await asyncio.to_thread(db_fingerprint)
+            logging.info("Baza avtomatik tiklandi")
+            try:
+                await bot.send_message(chat_id, "✅ Baza avtomatik tiklandi (qadalgan zaxiradan).")
+            except Exception:
+                pass
+    except Exception:
+        logging.exception("avtomatik tiklash xatosi")
+    finally:
+        RESTORE_DONE.set()
+
+
+async def startup_restore_once():
+    if _restore_ran[0]:
+        return
+    _restore_ran[0] = True
+    await startup_restore()
+
+
 async def backup_worker():
-    await asyncio.sleep(90)
+    await RESTORE_DONE.wait()
+    await asyncio.sleep(30)
     while True:
         try:
-            if ADMIN_IDS:
-                await send_backup(sorted(ADMIN_IDS)[0], "💾 Avtomatik zaxira nusxa")
+            chat_id = _admin_chat_id()
+            if chat_id:
+                await push_backup(chat_id)
         except Exception as ex:
             logging.warning("auto-backup xatosi: %s", ex)
-        await asyncio.sleep(max(BACKUP_HOURS, 0.1) * 3600)
+        await asyncio.sleep(max(BACKUP_MINUTES, 1) * 60)
 
 
 # ---------------- Qidiruv (eng oxirida) ----------------
@@ -787,6 +950,8 @@ async def main():
     asyncio.create_task(backup_worker())
     while True:
         try:
+            await wait_for_valid_token()
+            await startup_restore_once()
             print("Bot polling boshlandi...")
             await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, drop_pending_updates=True)
