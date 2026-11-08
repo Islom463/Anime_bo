@@ -707,6 +707,69 @@ async def adm_title(callback: types.CallbackQuery):
     await callback.message.answer(f"<b>{e(t[2])}</b>\n📺 Qismlar: {n} · 👁 {t[5]}\n🔗 <code>{link}</code>", reply_markup=kb)
 
 
+async def build_catalog_chunks():
+    """Barcha anime va kinolar mundarijasi (har biri bosiladigan havola). Telegram limiti uchun bo'laklarga bo'linadi."""
+    with db() as c:
+        rows = c.execute("SELECT id, name, category FROM titles ORDER BY category, name COLLATE NOCASE").fetchall()
+    if not rows:
+        return []
+    uname = await bot_username()
+    blocks = []
+    for cat, head in (("anime", "🎌 <b>ANIMELAR</b>"), ("kino", "🎬 <b>KINOLAR</b>")):
+        items = [r for r in rows if r[2] == cat]
+        if not items:
+            continue
+        blocks.append(head)
+        for i, (tid, name, _) in enumerate(items, 1):
+            blocks.append(f'{i}. <a href="https://t.me/{uname}?start=t{tid}">{e(name)}</a>')
+    chunks, cur = [], "📑 <b>MUNDARIJA</b>\n"
+    for line in blocks:
+        if len(cur) + len(line) + 1 > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += "\n" + line
+    chunks.append(cur)
+    return chunks
+
+
+@dp.message(Command("mundarija"))
+async def cmd_catalog(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    chunks = await build_catalog_chunks()
+    if not chunks:
+        return await message.answer("Hali hech narsa qo'shilmagan.")
+    for i, ch in enumerate(chunks):
+        last = i == len(chunks) - 1
+        kb = None
+        if last and POST_CHANNELS:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[btn("📣 Kanalga yuborish", "adm:mun")]])
+        await message.answer(ch, reply_markup=kb, disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "adm:mun")
+async def adm_catalog_to_channels(callback: types.CallbackQuery):
+    if not await admin_only(callback):
+        return
+    if not POST_CHANNELS:
+        return await callback.answer("POST_CHANNELS kiritilmagan", show_alert=True)
+    await callback.answer("Yuborilmoqda...")
+    chunks = await build_catalog_chunks()
+    ok, bad = [], []
+    for ch in POST_CHANNELS:
+        try:
+            for part in chunks:
+                await bot.send_message(ch, part, disable_web_page_preview=True)
+            ok.append(ch)
+        except Exception as ex:
+            logging.warning("mundarija yuborilmadi (%s): %s", ch, ex)
+            bad.append(f"{ch} — {type(ex).__name__}")
+    text = ("✅ Yuborildi: " + ", ".join(ok)) if ok else ""
+    if bad:
+        text += ("\n" if text else "") + "❌ Yuborilmadi:\n" + "\n".join(bad)
+    await callback.message.answer(text)
+
+
 @dp.callback_query(F.data.startswith("adm:post:"))
 async def adm_post_to_channels(callback: types.CallbackQuery):
     """Anime/kino kartasini kanal(lar)ga 'Tomosha qilish' tugmasi bilan yuboradi."""
