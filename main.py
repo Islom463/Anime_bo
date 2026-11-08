@@ -11,6 +11,7 @@ Render Environment:
   PROTECT_CONTENT    - ixtiyoriy: 1 bo'lsa videoni forward/saqlash taqiqlanadi
   DB_PATH            - ixtiyoriy (Persistent Disk bo'lsa: /var/data/anime.db)
   BACKUP_MINUTES     - ixtiyoriy: avtomatik zaxira oralig'i (daqiqa), standart 30
+  POST_CHANNELS      - ixtiyoriy: postlar yuboriladigan kanallar: @kanal1,@kanal2 (bot kanalda admin bo'lishi kerak)
 """
 import os
 import re
@@ -49,6 +50,8 @@ ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_ID", "") + " " 
 REQUIRED = [c.strip() for c in re.split(r"[,\s]+", os.getenv("REQUIRED_CHANNELS", "")) if c.strip()]
 REQUIRED = [c if c.startswith("@") or c.startswith("-100") else "@" + c for c in REQUIRED]
 PROTECT = os.getenv("PROTECT_CONTENT", "0") == "1"
+POST_CHANNELS = [c.strip() for c in re.split(r"[,\s]+", os.getenv("POST_CHANNELS", "")) if c.strip()]
+POST_CHANNELS = [c if c.startswith("@") or c.startswith("-100") else "@" + c for c in POST_CHANNELS]
 try:
     BACKUP_MINUTES = float(os.getenv("BACKUP_MINUTES", "30"))
 except ValueError:
@@ -621,7 +624,11 @@ async def add_done(message: types.Message, state: FSMContext):
     if not eps:
         return await message.answer("⚠️ Hech qanday video yuborilmadi.", reply_markup=menu_kb())
     link = f"https://t.me/{await bot_username()}?start=t{tid}"
-    await message.answer(f"✅ Tayyor! {len(eps)} ta qism saqlandi.\n\n🔗 Havola:\n<code>{link}</code>", reply_markup=menu_kb())
+    rows = [[btn("📣 Kanalga yuborish", f"adm:post:{tid}")]] if POST_CHANNELS else []
+    await message.answer(f"✅ Tayyor! {len(eps)} ta qism saqlandi.\n\n🔗 Havola:\n<code>{link}</code>",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else menu_kb())
+    if rows:
+        await message.answer("👇 Pastdagi menyu qaytarildi.", reply_markup=menu_kb())
     run_bg(safe_push_backup())
 
 
@@ -696,8 +703,46 @@ async def adm_title(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("➕ Qism qo'shish", f"adm:eps:{tid}"), btn("➖ Oxirgi qismni o'chirish", f"adm:dl:{tid}")],
         [btn("👁 Ko'rish", f"t:{tid}"), btn("🗑 O'chirish", f"adm:del:{tid}")],
-    ])
+    ] + ([[btn("📣 Kanalga yuborish", f"adm:post:{tid}")]] if POST_CHANNELS else []))
     await callback.message.answer(f"<b>{e(t[2])}</b>\n📺 Qismlar: {n} · 👁 {t[5]}\n🔗 <code>{link}</code>", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("adm:post:"))
+async def adm_post_to_channels(callback: types.CallbackQuery):
+    """Anime/kino kartasini kanal(lar)ga 'Tomosha qilish' tugmasi bilan yuboradi."""
+    if not await admin_only(callback):
+        return
+    tid = to_int(callback.data.split(":")[2])
+    t = get_title(tid)
+    if not t:
+        return await callback.answer("Topilmadi", show_alert=True)
+    if not POST_CHANNELS:
+        return await callback.answer("Render'da POST_CHANNELS ni kiriting (masalan @kanal1,@kanal2)", show_alert=True)
+    await callback.answer("Yuborilmoqda...")
+    eps = get_episodes(tid)
+    icon = "🎌" if t[1] == "anime" else "🎬"
+    desc = e(t[3])[:600] if t[3] else ""
+    caption = (f"{icon} <b>{e(t[2])}</b>\n" + (f"\n{desc}\n" if desc else "")
+               + (f"\n📺 Qismlar: {len(eps)} ta" if len(eps) > 1 else "")
+               + f"\n\n▶️ Tomosha qilish: @{await bot_username()}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ Tomosha qilish", url=f"https://t.me/{await bot_username()}?start=t{tid}")]])
+    ok, bad = [], []
+    for ch in POST_CHANNELS:
+        try:
+            if t[4]:
+                await bot.send_photo(ch, t[4], caption=caption, reply_markup=kb)
+            else:
+                await bot.send_message(ch, caption, reply_markup=kb)
+            ok.append(ch)
+        except Exception as ex:
+            logging.warning("kanalga yuborib bo'lmadi (%s): %s", ch, ex)
+            bad.append(f"{ch} — {type(ex).__name__}")
+    text = ""
+    if ok:
+        text += "✅ Yuborildi: " + ", ".join(ok)
+    if bad:
+        text += ("\n" if text else "") + "❌ Yuborilmadi (bot kanalda admin ekanini tekshiring):\n" + "\n".join(bad)
+    await callback.message.answer(text or "Hech narsa yuborilmadi.")
 
 
 @dp.callback_query(F.data.startswith("adm:eps:"))
